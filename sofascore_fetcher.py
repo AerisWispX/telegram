@@ -7,9 +7,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
 import itertools
+from urllib.parse import urlencode
+import ssl
+import urllib3
 
 class SofaScoreFetcher:
-    def __init__(self, max_retries=3, base_delay=1):
+    def __init__(self, max_retries=2, base_delay=2):
         self.base_url = "https://api.sofascore.com/api/v1"
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -33,9 +36,30 @@ class SofaScoreFetcher:
         self.current_proxy = None
         self.failed_proxies = set()
         
-        # Headers to mimic a real browser
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        # Enhanced headers with more realistic browser fingerprint
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
+        ]
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
+        
+        # Disable SSL warnings for proxy connections
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Rate limiting
+        self.last_request_time = 0
+        self.min_request_interval = 5  # Minimum 5 seconds between requests
+        
+    def _get_headers(self) -> Dict[str, str]:
+        """Generate realistic headers with random user agent"""
+        return {
+            'User-Agent': random.choice(self.user_agents),
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -48,14 +72,12 @@ class SofaScoreFetcher:
             'Origin': 'https://www.sofascore.com',
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
+            'DNT': '1',
             'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"'
+            'sec-ch-ua-platform': '"Windows"',
+            'X-Requested-With': 'XMLHttpRequest'
         }
-        
-        # Setup logging
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
         
     def _get_proxy_config(self, proxy_string: str) -> Dict[str, str]:
         """Convert proxy string to requests proxy configuration"""
@@ -75,7 +97,7 @@ class SofaScoreFetcher:
     def _get_next_proxy(self) -> Optional[str]:
         """Get next available proxy from the rotation"""
         attempts = 0
-        max_attempts = len(self.proxies) * 2  # Allow full cycle twice
+        max_attempts = len(self.proxies) * 2
         
         while attempts < max_attempts:
             proxy = next(self.proxy_cycle)
@@ -85,80 +107,124 @@ class SofaScoreFetcher:
         
         # If all proxies are failed, reset and try again
         if self.failed_proxies:
-            self.logger.warning("All proxies failed, resetting failed proxy list")
+            self.logger.warning("🔄 All proxies failed, resetting failed proxy list")
             self.failed_proxies.clear()
             return next(self.proxy_cycle)
         
         return None
     
     def _create_session(self, proxy_string: str = None) -> requests.Session:
-        """Create a new session with proxy configuration"""
+        """Create a new session with enhanced configuration"""
         session = requests.Session()
-        session.headers.update(self.headers)
+        session.headers.update(self._get_headers())
         
         if proxy_string:
             proxy_config = self._get_proxy_config(proxy_string)
             if proxy_config:
                 session.proxies.update(proxy_config)
-                self.logger.info(f"🌐 Using proxy: {proxy_string.split(':')[0]}:{proxy_string.split(':')[1]}")
+                proxy_display = f"{proxy_string.split(':')[0]}:{proxy_string.split(':')[1]}"
+                self.logger.info(f"🌐 Using proxy: {proxy_display}")
+        
+        # Configure session for better reliability
+        adapter = requests.adapters.HTTPAdapter(
+            max_retries=urllib3.util.Retry(
+                total=0,  # We handle retries manually
+                backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504]
+            )
+        )
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
         
         return session
     
+    def _enforce_rate_limit(self):
+        """Enforce minimum time between requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last
+            self.logger.info(f"⏱️ Rate limiting: sleeping for {sleep_time:.1f}s")
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+    
     def _make_request(self, url: str, max_retries: int = None) -> Optional[Dict]:
-        """Make HTTP request with proxy rotation and retry logic"""
+        """Enhanced request method with better error handling"""
         max_retries = max_retries or self.max_retries
         
+        # Enforce rate limiting
+        self._enforce_rate_limit()
+        
         for attempt in range(max_retries):
-            # Get a proxy for this attempt
             proxy = self._get_next_proxy()
             if not proxy:
-                self.logger.error("No available proxies")
+                self.logger.error("❌ No available proxies")
                 break
                 
-            # Create session with current proxy
             session = self._create_session(proxy)
             self.current_proxy = proxy
             
             try:
-                # Random delay to avoid rate limiting
-                time.sleep(random.uniform(self.base_delay, self.base_delay + 2))
+                # Add some randomness to avoid pattern detection
+                time.sleep(random.uniform(1, 3))
                 
-                self.logger.info(f"🚀 Attempting request to {url} (attempt {attempt + 1}/{max_retries})")
+                self.logger.info(f"🚀 Request to {url} (attempt {attempt + 1}/{max_retries})")
                 
-                response = session.get(url, timeout=30)
+                response = session.get(
+                    url, 
+                    timeout=(15, 30),  # (connection, read) timeout
+                    verify=False,  # Skip SSL verification for proxies
+                    allow_redirects=True
+                )
                 
                 if response.status_code == 200:
-                    self.logger.info(f"✅ Success: {url}")
-                    return response.json()
+                    try:
+                        data = response.json()
+                        self.logger.info(f"✅ Success: {url}")
+                        return data
+                    except json.JSONDecodeError:
+                        self.logger.error(f"❌ Invalid JSON response from {url}")
+                        return None
+                        
                 elif response.status_code == 403:
-                    self.logger.warning(f"🚫 403 Forbidden with proxy {proxy.split(':')[0]} (attempt {attempt + 1})")
-                    # Mark this proxy as failed for this session
+                    self.logger.warning(f"🚫 403 Forbidden (attempt {attempt + 1})")
                     self.failed_proxies.add(proxy)
+                    
                 elif response.status_code == 429:
-                    self.logger.warning(f"⏰ Rate limited with proxy {proxy.split(':')[0]}")
-                    time.sleep(random.uniform(10, 20))
+                    self.logger.warning(f"⏰ Rate limited (attempt {attempt + 1})")
+                    time.sleep(random.uniform(15, 30))
+                    
                 elif response.status_code == 404:
-                    self.logger.info(f"🔍 Not found: {url}")
+                    self.logger.info(f"🔍 404 Not found: {url}")
                     return None
+                    
                 else:
                     self.logger.error(f"❌ HTTP {response.status_code}: {url}")
                     
             except requests.exceptions.ProxyError as e:
-                self.logger.error(f"🔌 Proxy error with {proxy.split(':')[0]}: {str(e)}")
+                self.logger.error(f"🔌 Proxy error: {str(e)}")
                 self.failed_proxies.add(proxy)
+                
             except requests.exceptions.Timeout:
-                self.logger.warning(f"⏱️ Timeout with proxy {proxy.split(':')[0]}: {url}")
+                self.logger.warning(f"⏱️ Request timeout")
                 self.failed_proxies.add(proxy)
+                
             except requests.exceptions.RequestException as e:
-                self.logger.error(f"🔌 Network error for {url}: {str(e)}")
+                self.logger.error(f"🔌 Request error: {str(e)}")
                 self.failed_proxies.add(proxy)
+                
+            except Exception as e:
+                self.logger.error(f"💥 Unexpected error: {str(e)}")
+                
             finally:
                 session.close()
                 
-            # Exponential backoff between attempts
+            # Progressive backoff between attempts
             if attempt < max_retries - 1:
-                delay = random.uniform(3 * (attempt + 1), 6 * (attempt + 1))
-                self.logger.info(f"⏳ Waiting {delay:.1f}s before next attempt...")
+                delay = random.uniform(5 * (attempt + 1), 10 * (attempt + 1))
+                self.logger.info(f"⏳ Waiting {delay:.1f}s before retry...")
                 time.sleep(delay)
                     
         self.logger.error(f"💥 Failed after {max_retries} attempts: {url}")
@@ -170,10 +236,7 @@ class SofaScoreFetcher:
         return self._make_request(url)
     
     def get_scheduled_matches(self, date: str = None) -> Optional[Dict]:
-        """
-        Fetch scheduled matches for a specific date
-        date format: YYYY-MM-DD (default: today)
-        """
+        """Fetch scheduled matches for a specific date"""
         if not date:
             date = datetime.now().strftime('%Y-%m-%d')
         
@@ -204,7 +267,7 @@ class SofaScoreFetcher:
         """Process live matches into simplified format"""
         live_data = self.get_live_matches()
         if not live_data or 'events' not in live_data:
-            self.logger.warning("No live match data received")
+            self.logger.warning("⚠️ No live match data received")
             return []
         
         processed_matches = []
@@ -227,29 +290,9 @@ class SofaScoreFetcher:
                     'startTime': event.get('startTimestamp', 0)
                 }
                 
-                # Try to get incidents for more detailed info, but don't fail if we can't
-                try:
-                    incidents = self.get_match_incidents(str(event['id']))
-                    if incidents and 'incidents' in incidents:
-                        for incident in incidents['incidents']:
-                            if incident.get('incidentType') == 'goal':
-                                scorer_info = {
-                                    'name': incident.get('player', {}).get('name', 'Unknown'),
-                                    'minute': incident.get('time', 0)
-                                }
-                                
-                                if incident.get('isHome', False):
-                                    match_data['homeScorers'].append(scorer_info)
-                                else:
-                                    match_data['awayScorers'].append(scorer_info)
-                            
-                            # Get current match time from latest incident
-                            if 'time' in incident and incident.get('time'):
-                                match_data['currentTime'] = incident['time']
-                            if 'addedTime' in incident:
-                                match_data['addedTime'] = incident['addedTime']
-                except Exception as e:
-                    self.logger.warning(f"Could not fetch incidents for match {event['id']}: {str(e)}")
+                # Get basic status info without fetching incidents to reduce API calls
+                if 'time' in event and event['time']:
+                    match_data['currentTime'] = event['time'].get('currentPeriodStartTimestamp', 0)
                 
                 processed_matches.append(match_data)
                 
@@ -264,7 +307,7 @@ class SofaScoreFetcher:
         """Process scheduled matches into simplified format"""
         scheduled_data = self.get_scheduled_matches(date)
         if not scheduled_data or 'events' not in scheduled_data:
-            self.logger.warning(f"No scheduled match data received for {date}")
+            self.logger.warning(f"⚠️ No scheduled match data for {date}")
             return []
         
         processed_matches = []
@@ -307,54 +350,46 @@ class SofaScoreFetcher:
         return {
             'total_proxies': len(self.proxies),
             'failed_proxies': len(self.failed_proxies),
+            'failed_proxy_list': list(self.failed_proxies),
             'current_proxy': self.current_proxy.split(':')[0] + ':' + self.current_proxy.split(':')[1] if self.current_proxy else None,
-            'available_proxies': len(self.proxies) - len(self.failed_proxies)
+            'available_proxies': len(self.proxies) - len(self.failed_proxies),
+            'success_rate': f"{((len(self.proxies) - len(self.failed_proxies)) / len(self.proxies) * 100):.1f}%"
         }
+    
+    def reset_failed_proxies(self):
+        """Reset failed proxies list - useful for periodic cleanup"""
+        self.logger.info(f"🔄 Resetting {len(self.failed_proxies)} failed proxies")
+        self.failed_proxies.clear()
 
 
 def main():
-    """Main function to demonstrate usage"""
-    fetcher = SofaScoreFetcher(max_retries=3, base_delay=2)
+    """Test the enhanced fetcher"""
+    fetcher = SofaScoreFetcher(max_retries=2, base_delay=3)
     
-    print("🚀 Starting SofaScore data fetch with proxy support...")
+    print("🚀 Starting enhanced SofaScore data fetch...")
     
-    # Show proxy status
+    # Show initial proxy status
     proxy_status = fetcher.get_proxy_status()
     print(f"🌐 Proxy status: {proxy_status['available_proxies']}/{proxy_status['total_proxies']} available")
     
-    # Fetch live matches
-    print("\n📺 Fetching live matches...")
+    # Test with live matches first (usually more reliable)
+    print("\n📺 Testing live matches endpoint...")
     live_matches = fetcher.process_live_matches()
+    
     if live_matches:
-        print(f"✅ Found {len(live_matches)} live matches")
-        fetcher.save_to_json({'matches': live_matches}, 'live_matches.json')
-        
-        # Display first few live matches
-        for i, match in enumerate(live_matches[:3]):
+        print(f"✅ Successfully fetched {len(live_matches)} live matches")
+        for i, match in enumerate(live_matches[:2]):
             print(f"   {match['home']} {match['homeScore']}-{match['awayScore']} {match['away']} ({match['status']})")
     else:
-        print("❌ No live matches found or failed to fetch")
-    
-    # Fetch scheduled matches for today
-    print("\n📅 Fetching today's scheduled matches...")
-    today = datetime.now().strftime('%Y-%m-%d')
-    scheduled_matches = fetcher.process_scheduled_matches(today)
-    if scheduled_matches:
-        print(f"✅ Found {len(scheduled_matches)} scheduled matches for {today}")
-        fetcher.save_to_json({'matches': scheduled_matches}, 'scheduled_matches.json')
-        
-        # Display first few scheduled matches
-        for i, match in enumerate(scheduled_matches[:3]):
-            start_time = datetime.fromtimestamp(match['timestamp']).strftime('%H:%M')
-            print(f"   {start_time} - {match['home']} vs {match['away']} ({match['tournament']})")
-    else:
-        print("❌ No scheduled matches found or failed to fetch")
+        print("❌ Failed to fetch live matches")
     
     # Show final proxy status
-    final_proxy_status = fetcher.get_proxy_status()
-    print(f"\n🌐 Final proxy status: {final_proxy_status}")
+    final_status = fetcher.get_proxy_status()
+    print(f"\n🌐 Final proxy status: {final_status['success_rate']} success rate")
+    print(f"   Available: {final_status['available_proxies']}/{final_status['total_proxies']}")
     
-    print("\n🎉 Data fetch completed!")
+    if final_status['failed_proxies'] > 0:
+        print(f"   Failed proxies: {final_status['failed_proxies']}")
 
 
 if __name__ == "__main__":
