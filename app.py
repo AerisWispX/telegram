@@ -2,35 +2,14 @@ import requests
 import json
 import time
 import random
-import os
-import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import logging
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-import atexit
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('sofascore.log'),
-        logging.StreamHandler()
-    ]
-)
 
 class SofaScoreFetcher:
-    def __init__(self, data_dir="data"):
+    def __init__(self):
         self.session = requests.Session()
         self.base_url = "https://api.sofascore.com/api/v1"
-        self.data_dir = data_dir
-        
-        # Create data directory if it doesn't exist
-        os.makedirs(self.data_dir, exist_ok=True)
         
         # Headers to mimic a real browser
         self.headers = {
@@ -50,6 +29,9 @@ class SofaScoreFetcher:
         }
         
         self.session.headers.update(self.headers)
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
         
     def _make_request(self, url: str, max_retries: int = 3) -> Optional[Dict]:
@@ -67,6 +49,7 @@ class SofaScoreFetcher:
                 elif response.status_code == 403:
                     self.logger.warning(f"403 Forbidden for {url}, attempt {attempt + 1}")
                     if attempt < max_retries - 1:
+                        # Longer delay on 403
                         time.sleep(random.uniform(5, 10))
                 elif response.status_code == 429:
                     self.logger.warning(f"Rate limited for {url}, waiting...")
@@ -87,7 +70,10 @@ class SofaScoreFetcher:
         return self._make_request(url)
     
     def get_scheduled_matches(self, date: str = None) -> Optional[Dict]:
-        """Fetch scheduled matches for a specific date"""
+        """
+        Fetch scheduled matches for a specific date
+        date format: YYYY-MM-DD (default: today)
+        """
         if not date:
             date = datetime.now().strftime('%Y-%m-%d')
         
@@ -104,6 +90,16 @@ class SofaScoreFetcher:
         url = f"{self.base_url}/event/{event_id}/incidents"
         return self._make_request(url)
     
+    def get_match_lineups(self, event_id: str) -> Optional[Dict]:
+        """Fetch match lineups"""
+        url = f"{self.base_url}/event/{event_id}/lineups"
+        return self._make_request(url)
+    
+    def get_match_statistics(self, event_id: str) -> Optional[Dict]:
+        """Fetch match statistics"""
+        url = f"{self.base_url}/event/{event_id}/statistics"
+        return self._make_request(url)
+    
     def process_live_matches(self) -> List[Dict]:
         """Process live matches into simplified format"""
         live_data = self.get_live_matches()
@@ -114,6 +110,7 @@ class SofaScoreFetcher:
         
         for event in live_data['events']:
             try:
+                # Get incidents for live match to get current score and scorers
                 incidents = self.get_match_incidents(str(event['id']))
                 
                 match_data = {
@@ -129,10 +126,10 @@ class SofaScoreFetcher:
                     'awayScorers': [],
                     'isLive': True,
                     'tournament': event.get('tournament', {}).get('name', ''),
-                    'startTime': event.get('startTimestamp', 0),
-                    'lastUpdated': int(time.time())
+                    'startTime': event.get('startTimestamp', 0)
                 }
                 
+                # Process incidents to get scorers and current time
                 if incidents and 'incidents' in incidents:
                     for incident in incidents['incidents']:
                         if incident.get('incidentType') == 'goal':
@@ -146,6 +143,7 @@ class SofaScoreFetcher:
                             else:
                                 match_data['awayScorers'].append(scorer_info)
                         
+                        # Get current match time from latest incident
                         if 'time' in incident and incident.get('time'):
                             match_data['currentTime'] = incident['time']
                         if 'addedTime' in incident:
@@ -179,8 +177,7 @@ class SofaScoreFetcher:
                     'isLive': False,
                     'tournament': event.get('tournament', {}).get('name', ''),
                     'startTime': event.get('startTimestamp', 0),
-                    'timestamp': event.get('startTimestamp', 0),
-                    'lastUpdated': int(time.time())
+                    'timestamp': event.get('startTimestamp', 0)
                 }
                 
                 processed_matches.append(match_data)
@@ -192,254 +189,65 @@ class SofaScoreFetcher:
         return processed_matches
     
     def save_to_json(self, data: Dict, filename: str):
-        """Save data to JSON file in data directory"""
+        """Save data to JSON file"""
         try:
-            filepath = os.path.join(self.data_dir, filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"Data saved to {filepath}")
-            return True
+            self.logger.info(f"Data saved to {filename}")
         except Exception as e:
             self.logger.error(f"Failed to save data to {filename}: {str(e)}")
-            return False
+
+
+def main():
+    """Main function to demonstrate usage"""
+    fetcher = SofaScoreFetcher()
     
-    def load_from_json(self, filename: str) -> Optional[Dict]:
-        """Load data from JSON file in data directory"""
-        try:
-            filepath = os.path.join(self.data_dir, filename)
-            if os.path.exists(filepath):
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            self.logger.error(f"Failed to load data from {filename}: {str(e)}")
-        return None
+    print("🚀 Starting SofaScore data fetch...")
     
-    def fetch_and_store_all_data(self):
-        """Fetch and store all data periodically"""
-        self.logger.info("🔄 Starting data fetch cycle...")
+    # Fetch live matches
+    print("\n📺 Fetching live matches...")
+    live_matches = fetcher.process_live_matches()
+    if live_matches:
+        print(f"✅ Found {len(live_matches)} live matches")
+        fetcher.save_to_json({'matches': live_matches}, 'live_matches.json')
         
-        # Fetch live matches
-        live_matches = self.process_live_matches()
-        if live_matches:
-            data = {
-                'matches': live_matches,
-                'lastUpdated': int(time.time()),
-                'count': len(live_matches)
-            }
-            self.save_to_json(data, 'live_matches.json')
-            self.logger.info(f"✅ Saved {len(live_matches)} live matches")
+        # Display first few live matches
+        for i, match in enumerate(live_matches[:3]):
+            print(f"   {match['home']} {match['homeScore']}-{match['awayScore']} {match['away']} ({match['status']})")
+    else:
+        print("❌ No live matches found or failed to fetch")
+    
+    # Fetch scheduled matches for today
+    print("\n📅 Fetching today's scheduled matches...")
+    today = datetime.now().strftime('%Y-%m-%d')
+    scheduled_matches = fetcher.process_scheduled_matches(today)
+    if scheduled_matches:
+        print(f"✅ Found {len(scheduled_matches)} scheduled matches for {today}")
+        fetcher.save_to_json({'matches': scheduled_matches}, 'scheduled_matches.json')
         
-        # Fetch scheduled matches for today and tomorrow
-        today = datetime.now().strftime('%Y-%m-%d')
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-        
-        for date, label in [(today, 'today'), (tomorrow, 'tomorrow')]:
-            scheduled_matches = self.process_scheduled_matches(date)
-            if scheduled_matches:
-                data = {
-                    'matches': scheduled_matches,
-                    'lastUpdated': int(time.time()),
-                    'count': len(scheduled_matches),
-                    'date': date
-                }
-                filename = f'scheduled_matches_{label}.json'
-                self.save_to_json(data, filename)
-                self.logger.info(f"✅ Saved {len(scheduled_matches)} scheduled matches for {label}")
-        
-        self.logger.info("✨ Data fetch cycle completed")
-
-
-# Flask Application
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-fetcher = SofaScoreFetcher()
-
-@app.route('/')
-def index():
-    """API Information endpoint"""
-    return jsonify({
-        'service': 'SofaScore API Fetcher',
-        'version': '1.0.0',
-        'endpoints': {
-            '/api/live': 'Get live matches',
-            '/api/scheduled': 'Get scheduled matches for today',
-            '/api/scheduled/tomorrow': 'Get scheduled matches for tomorrow',
-            '/api/match/<match_id>': 'Get specific match details',
-            '/api/status': 'Get service status',
-            '/health': 'Health check endpoint'
-        },
-        'status': 'running',
-        'timestamp': int(time.time())
-    })
-
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': int(time.time()),
-        'service': 'sofascore-fetcher'
-    })
-
-@app.route('/api/live')
-def get_live_matches():
-    """Get live matches from stored data or fetch new if old"""
-    data = fetcher.load_from_json('live_matches.json')
+        # Display first few scheduled matches
+        for i, match in enumerate(scheduled_matches[:3]):
+            start_time = datetime.fromtimestamp(match['timestamp']).strftime('%H:%M')
+            print(f"   {start_time} - {match['home']} vs {match['away']} ({match['tournament']})")
+    else:
+        print("❌ No scheduled matches found or failed to fetch")
     
-    # If no data or data is older than 2 minutes, fetch new
-    if not data or (int(time.time()) - data.get('lastUpdated', 0)) > 120:
-        live_matches = fetcher.process_live_matches()
-        if live_matches:
-            data = {
-                'matches': live_matches,
-                'lastUpdated': int(time.time()),
-                'count': len(live_matches)
-            }
-            fetcher.save_to_json(data, 'live_matches.json')
-        else:
-            # Return old data if available
-            if data:
-                data['warning'] = 'Using cached data - API unavailable'
-            else:
-                return jsonify({'error': 'No live matches available', 'matches': []}), 503
+    # Fetch specific match details (example)
+    print("\n🔍 Fetching specific match details...")
+    if live_matches:
+        sample_match_id = live_matches[0]['id']
+        match_details = fetcher.get_match_details(str(sample_match_id))
+        if match_details:
+            print(f"✅ Fetched details for match ID {sample_match_id}")
+            fetcher.save_to_json(match_details, f'match_{sample_match_id}_details.json')
     
-    return jsonify(data)
+    print("\n🎉 Data fetch completed!")
+    print("\nGenerated files:")
+    print("- live_matches.json (processed live matches)")
+    print("- scheduled_matches.json (processed scheduled matches)")
+    if live_matches:
+        print(f"- match_{live_matches[0]['id']}_details.json (sample match details)")
 
-@app.route('/api/scheduled')
-def get_scheduled_matches():
-    """Get today's scheduled matches"""
-    data = fetcher.load_from_json('scheduled_matches_today.json')
-    
-    # If no data or data is older than 1 hour, fetch new
-    if not data or (int(time.time()) - data.get('lastUpdated', 0)) > 3600:
-        today = datetime.now().strftime('%Y-%m-%d')
-        scheduled_matches = fetcher.process_scheduled_matches(today)
-        if scheduled_matches:
-            data = {
-                'matches': scheduled_matches,
-                'lastUpdated': int(time.time()),
-                'count': len(scheduled_matches),
-                'date': today
-            }
-            fetcher.save_to_json(data, 'scheduled_matches_today.json')
-        else:
-            if data:
-                data['warning'] = 'Using cached data - API unavailable'
-            else:
-                return jsonify({'error': 'No scheduled matches available', 'matches': []}), 503
-    
-    return jsonify(data)
 
-@app.route('/api/scheduled/tomorrow')
-def get_scheduled_matches_tomorrow():
-    """Get tomorrow's scheduled matches"""
-    data = fetcher.load_from_json('scheduled_matches_tomorrow.json')
-    
-    # If no data or data is older than 1 hour, fetch new
-    if not data or (int(time.time()) - data.get('lastUpdated', 0)) > 3600:
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-        scheduled_matches = fetcher.process_scheduled_matches(tomorrow)
-        if scheduled_matches:
-            data = {
-                'matches': scheduled_matches,
-                'lastUpdated': int(time.time()),
-                'count': len(scheduled_matches),
-                'date': tomorrow
-            }
-            fetcher.save_to_json(data, 'scheduled_matches_tomorrow.json')
-        else:
-            if data:
-                data['warning'] = 'Using cached data - API unavailable'
-            else:
-                return jsonify({'error': 'No scheduled matches available', 'matches': []}), 503
-    
-    return jsonify(data)
-
-@app.route('/api/match/<int:match_id>')
-def get_match_details(match_id):
-    """Get detailed information for a specific match"""
-    try:
-        # Try to load from cache first
-        filename = f'match_{match_id}_details.json'
-        data = fetcher.load_from_json(filename)
-        
-        # If no cached data or data is older than 5 minutes, fetch new
-        if not data or (int(time.time()) - data.get('lastUpdated', 0)) > 300:
-            match_details = fetcher.get_match_details(str(match_id))
-            if match_details:
-                data = {
-                    'match': match_details,
-                    'lastUpdated': int(time.time())
-                }
-                fetcher.save_to_json(data, filename)
-            else:
-                if data:
-                    data['warning'] = 'Using cached data - API unavailable'
-                else:
-                    return jsonify({'error': f'Match {match_id} not found'}), 404
-        
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({'error': f'Failed to fetch match details: {str(e)}'}), 500
-
-@app.route('/api/status')
-def get_status():
-    """Get service status and statistics"""
-    live_data = fetcher.load_from_json('live_matches.json')
-    today_data = fetcher.load_from_json('scheduled_matches_today.json')
-    
-    return jsonify({
-        'service': 'SofaScore Fetcher',
-        'status': 'running',
-        'timestamp': int(time.time()),
-        'data_status': {
-            'live_matches': {
-                'available': live_data is not None,
-                'count': live_data.get('count', 0) if live_data else 0,
-                'last_updated': live_data.get('lastUpdated', 0) if live_data else 0
-            },
-            'scheduled_matches': {
-                'available': today_data is not None,
-                'count': today_data.get('count', 0) if today_data else 0,
-                'last_updated': today_data.get('lastUpdated', 0) if today_data else 0
-            }
-        }
-    })
-
-@app.route('/api/refresh')
-def force_refresh():
-    """Force refresh all data"""
-    try:
-        fetcher.fetch_and_store_all_data()
-        return jsonify({
-            'message': 'Data refresh completed',
-            'timestamp': int(time.time())
-        })
-    except Exception as e:
-        return jsonify({
-            'error': f'Refresh failed: {str(e)}'
-        }), 500
-
-# Background scheduler setup
-scheduler = BackgroundScheduler()
-scheduler.start()
-
-# Schedule data fetching every 2 minutes for live matches
-scheduler.add_job(
-    func=fetcher.fetch_and_store_all_data,
-    trigger=IntervalTrigger(minutes=2),
-    id='fetch_data_job',
-    name='Fetch SofaScore data',
-    replace_existing=True
-)
-
-# Shut down the scheduler when exiting the app
-atexit.register(lambda: scheduler.shutdown())
-
-if __name__ == '__main__':
-    # Initial data fetch
-    fetcher.fetch_and_store_all_data()
-    
-    # Run the Flask app
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == "__main__":
+    main()
