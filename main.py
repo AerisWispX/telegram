@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="SofaScore Match API",
     description="API for fetching and serving football match data",
-    version="1.0.0",
+    version="1.0.1",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -32,7 +32,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,12 +47,14 @@ LIVE_MATCHES_FILE = DATA_DIR / "live_matches.json"
 SCHEDULED_MATCHES_FILE = DATA_DIR / "scheduled_matches.json"
 LAST_UPDATE_FILE = DATA_DIR / "last_update.json"
 
-# Initialize fetcher with production-friendly settings
-fetcher = SofaScoreFetcher(max_retries=2, base_delay=2)
+# Initialize fetcher with more conservative settings
+fetcher = SofaScoreFetcher(max_retries=2, base_delay=3)
 
-# Global variables for scheduler
+# Global variables
 scheduler_running = False
 last_successful_fetch = None
+fetch_failures = 0
+consecutive_failures = 0
 
 def save_json(data, filepath):
     """Save data to JSON file with error handling"""
@@ -80,58 +82,110 @@ def load_json(filepath, default=None):
         return default or {"matches": [], "lastUpdate": None, "count": 0}
 
 def update_last_fetch_time(success=True):
-    """Update last fetch timestamp"""
-    global last_successful_fetch
+    """Update last fetch timestamp with enhanced tracking"""
+    global last_successful_fetch, fetch_failures, consecutive_failures
     
     timestamp_data = {
         "lastUpdate": datetime.now().isoformat(),
         "timestamp": datetime.now().timestamp(),
-        "success": success
+        "success": success,
+        "totalFailures": fetch_failures,
+        "consecutiveFailures": consecutive_failures
     }
     
     if success:
         last_successful_fetch = datetime.now()
+        consecutive_failures = 0
         timestamp_data["lastSuccessfulFetch"] = last_successful_fetch.isoformat()
+        logger.info("✅ Successful fetch recorded")
+    else:
+        fetch_failures += 1
+        consecutive_failures += 1
+        logger.warning(f"❌ Fetch failure recorded (consecutive: {consecutive_failures})")
+        
+        # Reset failed proxies after multiple consecutive failures
+        if consecutive_failures >= 3:
+            logger.info("🔄 Resetting failed proxies due to consecutive failures")
+            fetcher.reset_failed_proxies()
     
     save_json(timestamp_data, LAST_UPDATE_FILE)
 
 async def fetch_and_store_data():
-    """Fetch data from SofaScore and store in JSON files"""
+    """Enhanced data fetching with better error recovery"""
     try:
         logger.info("🚀 Starting data fetch...")
         success = False
+        partial_success = False
         
-        # Fetch live matches
+        # Check proxy status before starting
+        proxy_status = fetcher.get_proxy_status()
+        logger.info(f"🌐 Proxy status: {proxy_status['available_proxies']}/{proxy_status['total_proxies']} available")
+        
+        # If too many proxies failed, reset them
+        if proxy_status['available_proxies'] < 3:
+            logger.info("🔄 Low proxy availability, resetting failed proxies")
+            fetcher.reset_failed_proxies()
+        
+        # Fetch live matches with retry
+        live_matches_data = None
         try:
+            logger.info("📺 Fetching live matches...")
             live_matches = fetcher.process_live_matches()
+            
             if live_matches is not None:
-                live_data = {
+                live_matches_data = {
                     "matches": live_matches,
                     "lastUpdate": datetime.now().isoformat(),
                     "count": len(live_matches),
                     "status": "success"
                 }
-                save_json(live_data, LIVE_MATCHES_FILE)
-                logger.info(f"✅ Updated live matches: {len(live_matches)} matches")
+                save_json(live_matches_data, LIVE_MATCHES_FILE)
+                logger.info(f"✅ Live matches: {len(live_matches)} matches")
                 success = True
+                partial_success = True
             else:
                 logger.warning("⚠️ No live matches data received")
+                # Keep existing data but mark as stale
+                existing_data = load_json(LIVE_MATCHES_FILE)
+                if existing_data.get("matches"):
+                    existing_data["status"] = "stale"
+                    existing_data["lastAttempt"] = datetime.now().isoformat()
+                    save_json(existing_data, LIVE_MATCHES_FILE)
+                
         except Exception as e:
             logger.error(f"❌ Error fetching live matches: {str(e)}")
         
-        # Fetch scheduled matches for today and tomorrow
+        # Add delay between requests
+        await asyncio.sleep(5)
+        
+        # Fetch scheduled matches with enhanced error handling
         try:
+            logger.info("📅 Fetching scheduled matches...")
             today = datetime.now().strftime('%Y-%m-%d')
             tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
             
-            scheduled_today = fetcher.process_scheduled_matches(today)
-            scheduled_tomorrow = fetcher.process_scheduled_matches(tomorrow)
-            
             all_scheduled = []
-            if scheduled_today:
-                all_scheduled.extend(scheduled_today)
-            if scheduled_tomorrow:
-                all_scheduled.extend(scheduled_tomorrow)
+            
+            # Try today's matches
+            try:
+                scheduled_today = fetcher.process_scheduled_matches(today)
+                if scheduled_today:
+                    all_scheduled.extend(scheduled_today)
+                    logger.info(f"✅ Today's matches: {len(scheduled_today)}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch today's matches: {str(e)}")
+            
+            # Add delay before next request
+            await asyncio.sleep(3)
+            
+            # Try tomorrow's matches
+            try:
+                scheduled_tomorrow = fetcher.process_scheduled_matches(tomorrow)
+                if scheduled_tomorrow:
+                    all_scheduled.extend(scheduled_tomorrow)
+                    logger.info(f"✅ Tomorrow's matches: {len(scheduled_tomorrow)}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch tomorrow's matches: {str(e)}")
             
             if all_scheduled:
                 scheduled_data = {
@@ -141,22 +195,36 @@ async def fetch_and_store_data():
                     "status": "success"
                 }
                 save_json(scheduled_data, SCHEDULED_MATCHES_FILE)
-                logger.info(f"✅ Updated scheduled matches: {len(all_scheduled)} matches")
+                logger.info(f"✅ Scheduled matches: {len(all_scheduled)} total")
                 success = True
+                partial_success = True
             else:
                 logger.warning("⚠️ No scheduled matches data received")
+                # Keep existing data but mark as stale
+                existing_data = load_json(SCHEDULED_MATCHES_FILE)
+                if existing_data.get("matches"):
+                    existing_data["status"] = "stale"
+                    existing_data["lastAttempt"] = datetime.now().isoformat()
+                    save_json(existing_data, SCHEDULED_MATCHES_FILE)
+                
         except Exception as e:
             logger.error(f"❌ Error fetching scheduled matches: {str(e)}")
         
-        # Update last fetch time
-        update_last_fetch_time(success)
+        # Update fetch status
+        update_last_fetch_time(success or partial_success)
+        
+        # Log final proxy status
+        final_proxy_status = fetcher.get_proxy_status()
+        logger.info(f"🌐 Final proxy status: {final_proxy_status['success_rate']}")
         
         if success:
             logger.info("🎉 Data fetch completed successfully")
+        elif partial_success:
+            logger.info("⚠️ Data fetch partially successful")
         else:
-            logger.warning("⚠️ Data fetch completed with warnings")
+            logger.error("❌ Data fetch failed completely")
         
-        return success
+        return success or partial_success
         
     except Exception as e:
         logger.error(f"💥 Critical error in fetch_and_store_data: {str(e)}")
@@ -164,37 +232,67 @@ async def fetch_and_store_data():
         return False
 
 def scheduled_fetch():
-    """Wrapper for scheduled fetching"""
+    """Wrapper for scheduled fetching with enhanced error handling"""
     try:
+        logger.info("⏰ Running scheduled fetch...")
+        
+        # Check if we should skip this fetch due to too many consecutive failures
+        global consecutive_failures
+        if consecutive_failures >= 5:
+            logger.warning(f"🛑 Skipping fetch due to {consecutive_failures} consecutive failures")
+            
+            # Reset after waiting longer
+            if consecutive_failures >= 10:
+                logger.info("🔄 Resetting failure count after extended wait")
+                consecutive_failures = 0
+                fetcher.reset_failed_proxies()
+            
+            return
+        
         # Run async function in thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(fetch_and_store_data())
+        success = loop.run_until_complete(fetch_and_store_data())
         loop.close()
+        
+        if not success:
+            logger.warning("⚠️ Scheduled fetch failed")
+        
     except Exception as e:
         logger.error(f"💥 Error in scheduled fetch: {str(e)}")
 
 def run_scheduler():
-    """Run the scheduler in a separate thread"""
+    """Run the scheduler with dynamic intervals based on success rate"""
     global scheduler_running
     scheduler_running = True
     
-    # Schedule fetches every 3 minutes
-    schedule.every(3).minutes.do(scheduled_fetch)
+    # Start with longer intervals due to API issues
+    schedule.every(5).minutes.do(scheduled_fetch)
     
-    logger.info("⏰ Scheduler started - fetching every 3 minutes")
+    logger.info("⏰ Scheduler started - fetching every 5 minutes")
     
     while scheduler_running:
         try:
             schedule.run_pending()
-            import time
+            
+            # Adjust schedule based on consecutive failures
+            if consecutive_failures >= 3:
+                # Increase interval if we're having problems
+                schedule.clear()
+                schedule.every(10).minutes.do(scheduled_fetch)
+                logger.info("📈 Increased fetch interval to 10 minutes due to failures")
+            elif consecutive_failures == 0:
+                # Reset to normal interval if everything is working
+                schedule.clear()
+                schedule.every(5).minutes.do(scheduled_fetch)
+            
             time.sleep(30)  # Check every 30 seconds
+            
         except Exception as e:
             logger.error(f"💥 Scheduler error: {str(e)}")
-            import time
-            time.sleep(60)  # Wait 1 minute on error
+            time.sleep(60)
 
-# API Endpoints
+# API Endpoints with enhanced error handling
 
 @app.on_event("startup")
 async def startup_event():
@@ -205,8 +303,13 @@ async def startup_event():
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     
-    # Initial data fetch
-    await fetch_and_store_data()
+    # Initial data fetch (but don't fail startup if it fails)
+    try:
+        await fetch_and_store_data()
+        logger.info("✅ Initial data fetch completed")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial data fetch failed: {str(e)}")
+    
     logger.info("✅ Server startup completed")
 
 @app.on_event("shutdown")
@@ -218,99 +321,174 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
-    """Root endpoint with API information"""
+    """Root endpoint with enhanced API information"""
     last_update_data = load_json(LAST_UPDATE_FILE)
     
     return {
         "message": "SofaScore Match API",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "status": "running",
         "lastUpdate": last_update_data.get("lastUpdate", "Never"),
         "lastSuccessfulFetch": last_update_data.get("lastSuccessfulFetch", "Never"),
+        "totalFailures": last_update_data.get("totalFailures", 0),
+        "consecutiveFailures": last_update_data.get("consecutiveFailures", 0),
+        "proxyStatus": fetcher.get_proxy_status(),
         "endpoints": {
             "live": "/api/livescores",
             "scheduled": "/api/scheduled", 
             "refresh": "/api/refresh",
             "status": "/api/status",
+            "proxy-status": "/api/proxy-status",
             "docs": "/docs"
         }
     }
 
 @app.get("/api/livescores")
 async def get_live_scores():
-    """Get live match scores - compatible with your existing API"""
+    """Get live match scores with enhanced error handling"""
     try:
         data = load_json(LIVE_MATCHES_FILE)
         
-        # Ensure the response format matches your current API
+        # Add data freshness information
+        last_update = data.get("lastUpdate")
+        is_stale = False
+        age_minutes = None
+        
+        if last_update:
+            try:
+                update_time = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+                age_minutes = (datetime.now() - update_time.replace(tzinfo=None)).total_seconds() / 60
+                is_stale = age_minutes > 15  # Mark as stale if older than 15 minutes
+            except:
+                pass
+        
         return JSONResponse(content={
             "matches": data.get("matches", []),
-            "lastUpdate": data.get("lastUpdate"),
-            "count": data.get("count", 0)
+            "lastUpdate": last_update,
+            "count": data.get("count", 0),
+            "status": data.get("status", "unknown"),
+            "dataAge": {
+                "minutes": int(age_minutes) if age_minutes else None,
+                "isStale": is_stale
+            }
         })
+        
     except Exception as e:
         logger.error(f"💥 Error serving live scores: {str(e)}")
         
-        # Return empty but valid response on error
-        return JSONResponse(content={
-            "matches": [],
-            "lastUpdate": None,
-            "count": 0,
-            "error": "Failed to load live scores"
-        })
+        return JSONResponse(
+            status_code=500,
+            content={
+                "matches": [],
+                "lastUpdate": None,
+                "count": 0,
+                "error": "Failed to load live scores",
+                "message": "Service temporarily unavailable"
+            }
+        )
 
 @app.get("/api/scheduled")
 async def get_scheduled_matches():
-    """Get scheduled matches - compatible with your existing API"""
+    """Get scheduled matches with enhanced error handling"""
     try:
         data = load_json(SCHEDULED_MATCHES_FILE)
         
+        # Add data freshness information
+        last_update = data.get("lastUpdate")
+        is_stale = False
+        age_minutes = None
+        
+        if last_update:
+            try:
+                update_time = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+                age_minutes = (datetime.now() - update_time.replace(tzinfo=None)).total_seconds() / 60
+                is_stale = age_minutes > 30  # Scheduled matches can be stale for longer
+            except:
+                pass
+        
         return JSONResponse(content={
             "matches": data.get("matches", []),
-            "lastUpdate": data.get("lastUpdate"),
-            "count": data.get("count", 0)
+            "lastUpdate": last_update,
+            "count": data.get("count", 0),
+            "status": data.get("status", "unknown"),
+            "dataAge": {
+                "minutes": int(age_minutes) if age_minutes else None,
+                "isStale": is_stale
+            }
         })
+        
     except Exception as e:
         logger.error(f"💥 Error serving scheduled matches: {str(e)}")
         
-        return JSONResponse(content={
-            "matches": [],
-            "lastUpdate": None,
-            "count": 0,
-            "error": "Failed to load scheduled matches"
-        })
+        return JSONResponse(
+            status_code=500,
+            content={
+                "matches": [],
+                "lastUpdate": None,
+                "count": 0,
+                "error": "Failed to load scheduled matches",
+                "message": "Service temporarily unavailable"
+            }
+        )
 
 @app.post("/api/refresh")
 async def refresh_data(background_tasks: BackgroundTasks):
     """Manually refresh match data"""
+    global consecutive_failures
+    
+    # Reset consecutive failures on manual refresh
+    consecutive_failures = 0
+    fetcher.reset_failed_proxies()
+    
     background_tasks.add_task(fetch_and_store_data)
+    
     return {
         "message": "Data refresh initiated", 
         "status": "processing",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "note": "Failed proxies have been reset"
     }
 
 @app.get("/api/status")
 async def get_status():
-    """Get API status and statistics"""
+    """Get comprehensive API status"""
     try:
         last_update_data = load_json(LAST_UPDATE_FILE)
         live_data = load_json(LIVE_MATCHES_FILE)
         scheduled_data = load_json(SCHEDULED_MATCHES_FILE)
         
-        # Calculate uptime
-        global last_successful_fetch
+        # Calculate uptime and health metrics
+        global last_successful_fetch, consecutive_failures
         minutes_since_last_fetch = "Never"
+        health_status = "degraded"
+        
         if last_successful_fetch:
             delta = datetime.now() - last_successful_fetch
             minutes_since_last_fetch = int(delta.total_seconds() / 60)
+            
+            if minutes_since_last_fetch < 10:
+                health_status = "healthy"
+            elif minutes_since_last_fetch < 30:
+                health_status = "degraded"
+            else:
+                health_status = "unhealthy"
+        
+        # Determine overall health
+        if consecutive_failures >= 5:
+            health_status = "critical"
+        
+        proxy_status = fetcher.get_proxy_status()
         
         return {
-            "status": "healthy" if scheduler_running else "degraded",
+            "status": health_status,
             "lastUpdate": last_update_data.get("lastUpdate", "Never"),
             "lastSuccessfulFetch": last_update_data.get("lastSuccessfulFetch", "Never"),
             "minutesSinceLastFetch": minutes_since_last_fetch,
             "schedulerRunning": scheduler_running,
+            "failures": {
+                "total": last_update_data.get("totalFailures", 0),
+                "consecutive": last_update_data.get("consecutiveFailures", 0)
+            },
             "statistics": {
                 "liveMatches": len(live_data.get("matches", [])),
                 "scheduledMatches": len(scheduled_data.get("matches", [])),
@@ -321,18 +499,87 @@ async def get_status():
                 "scheduledExists": SCHEDULED_MATCHES_FILE.exists(),
                 "lastUpdateExists": LAST_UPDATE_FILE.exists()
             },
+            "proxy": {
+                "available": proxy_status["available_proxies"],
+                "total": proxy_status["total_proxies"],
+                "failed": proxy_status["failed_proxies"],
+                "successRate": proxy_status["success_rate"],
+                "current": proxy_status["current_proxy"]
+            },
             "system": {
                 "dataDirectory": str(DATA_DIR),
-                "fetchInterval": "3 minutes"
+                "fetchInterval": "5-10 minutes (adaptive)"
             }
         }
+        
     except Exception as e:
         logger.error(f"💥 Error getting status: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error", 
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+@app.get("/api/proxy-status")
+async def get_proxy_status():
+    """Get detailed proxy status information"""
+    try:
+        proxy_status = fetcher.get_proxy_status()
+        
         return {
-            "status": "error", 
-            "message": str(e),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "proxies": {
+                "total": proxy_status["total_proxies"],
+                "available": proxy_status["available_proxies"],
+                "failed": proxy_status["failed_proxies"],
+                "successRate": proxy_status["success_rate"]
+            },
+            "current": proxy_status["current_proxy"],
+            "failedProxies": proxy_status.get("failed_proxy_list", []),
+            "actions": {
+                "reset": "/api/proxy-reset"
+            }
         }
+        
+    except Exception as e:
+        logger.error(f"💥 Error getting proxy status: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Failed to get proxy status",
+                "message": str(e)
+            }
+        )
+
+@app.post("/api/proxy-reset")
+async def reset_proxies():
+    """Reset failed proxies list"""
+    try:
+        old_failed_count = len(fetcher.failed_proxies)
+        fetcher.reset_failed_proxies()
+        
+        global consecutive_failures
+        consecutive_failures = 0
+        
+        return {
+            "message": "Proxy list reset successfully",
+            "clearedProxies": old_failed_count,
+            "timestamp": datetime.now().isoformat(),
+            "status": "success"
+        }
+        
+    except Exception as e:
+        logger.error(f"💥 Error resetting proxies: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Failed to reset proxies",
+                "message": str(e)
+            }
+        )
 
 @app.get("/api/match/{match_id}")
 async def get_match_details(match_id: str):
@@ -364,58 +611,100 @@ async def get_match_incidents(match_id: str):
         logger.error(f"💥 Error getting match incidents for {match_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Error fetching match incidents")
 
-# Health check endpoint for Coolify/Docker
+# Enhanced health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for monitoring"""
+    """Comprehensive health check endpoint"""
     try:
-        # Check if we have recent data
         last_update_data = load_json(LAST_UPDATE_FILE)
         last_update_str = last_update_data.get("lastUpdate")
         
         status = "healthy"
+        issues = []
+        
+        # Check data freshness
         if last_update_str:
-            last_update = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
-            minutes_since_update = (datetime.now() - last_update.replace(tzinfo=None)).total_seconds() / 60
-            
-            if minutes_since_update > 10:  # No update in 10 minutes
+            try:
+                last_update = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+                minutes_since_update = (datetime.now() - last_update.replace(tzinfo=None)).total_seconds() / 60
+                
+                if minutes_since_update > 15:
+                    status = "degraded"
+                    issues.append(f"Data is {int(minutes_since_update)} minutes old")
+            except:
                 status = "degraded"
+                issues.append("Unable to parse last update time")
+        else:
+            status = "unhealthy"
+            issues.append("No update data available")
+        
+        # Check consecutive failures
+        consecutive = last_update_data.get("consecutiveFailures", 0)
+        if consecutive >= 5:
+            status = "unhealthy"
+            issues.append(f"{consecutive} consecutive fetch failures")
+        elif consecutive >= 3:
+            if status == "healthy":
+                status = "degraded"
+            issues.append(f"{consecutive} consecutive fetch failures")
+        
+        # Check proxy availability
+        proxy_status = fetcher.get_proxy_status()
+        if proxy_status["available_proxies"] < 3:
+            if status == "healthy":
+                status = "degraded"
+            issues.append(f"Only {proxy_status['available_proxies']} proxies available")
         
         return {
             "status": status,
             "timestamp": datetime.now().isoformat(),
             "lastUpdate": last_update_str,
-            "schedulerRunning": scheduler_running
+            "schedulerRunning": scheduler_running,
+            "issues": issues,
+            "consecutiveFailures": consecutive,
+            "proxyAvailability": f"{proxy_status['available_proxies']}/{proxy_status['total_proxies']}"
         }
+        
     except Exception as e:
         logger.error(f"💥 Health check error: {str(e)}")
-        return {
-            "status": "unhealthy",
-            "timestamp": datetime.now().isoformat(),
-            "error": str(e)
-        }
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.now().isoformat(),
+                "error": str(e)
+            }
+        )
 
-# Add a simple metrics endpoint
 @app.get("/metrics")
 async def get_metrics():
-    """Simple metrics endpoint"""
+    """Enhanced metrics endpoint"""
     try:
         live_data = load_json(LIVE_MATCHES_FILE)
         scheduled_data = load_json(SCHEDULED_MATCHES_FILE)
         last_update_data = load_json(LAST_UPDATE_FILE)
+        proxy_status = fetcher.get_proxy_status()
         
         return {
             "live_matches_total": len(live_data.get("matches", [])),
             "scheduled_matches_total": len(scheduled_data.get("matches", [])),
             "last_update_timestamp": last_update_data.get("timestamp", 0),
-            "scheduler_running": 1 if scheduler_running else 0
+            "scheduler_running": 1 if scheduler_running else 0,
+            "total_failures": last_update_data.get("totalFailures", 0),
+            "consecutive_failures": last_update_data.get("consecutiveFailures", 0),
+            "available_proxies": proxy_status["available_proxies"],
+            "failed_proxies": proxy_status["failed_proxies"]
         }
     except Exception:
         return {
             "live_matches_total": 0,
             "scheduled_matches_total": 0,
             "last_update_timestamp": 0,
-            "scheduler_running": 0
+            "scheduler_running": 0,
+            "total_failures": 0,
+            "consecutive_failures": 0,
+            "available_proxies": 0,
+            "failed_proxies": 0
         }
 
 if __name__ == "__main__":
